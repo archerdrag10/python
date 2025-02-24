@@ -3,9 +3,12 @@ from datetime import datetime, timedelta, time
 from scipy.interpolate import interp1d
 import numpy as np
 import yfinance as yf
+import statistics
+import pandas as pd
+from collections import Counter
 
 MIN_30D_AVG_VOLUME = 2000000
-MIN_30D_IV_RV = 1.25
+MIN_30D_IV_HV_RATIO = 1.25
 MAX_TS_SLOPE_0_45 = -0.005
 
 BANKROLL = 100000
@@ -222,11 +225,12 @@ SCREENER_NAMES = [
 ]
 
 
-def filter_to_next_50d(dates, today: datetime):
-    return sorted([date for date in dates if datetime.strptime(date, "%Y-%m-%d").date() <= today.date() + timedelta(days=45) and datetime.strptime(date, "%Y-%m-%d").date() != today.date()])
+def sort_and_filter_to_next_45d(dates, today: datetime):
+    return sorted([datetime.strptime(date, "%Y-%m-%d").date() for date in dates if datetime.strptime(date, "%Y-%m-%d").date() <= today.date() + timedelta(days=45) and datetime.strptime(date, "%Y-%m-%d").date() != today.date()])
 
 
-def calculate_historical_volatility(price_data, window=30, trading_periods=252, return_last_only=True):
+# Calculates historical volatility using the Yang-Zhang equations: see https://www.jstor.org/stable/10.1086/209650?seq=6
+def calculate_30d_historical_volatility(price_data):
     log_ho = (price_data['High'] / price_data['Open']).apply(np.log)
     log_lo = (price_data['Low'] / price_data['Open']).apply(np.log)
     log_co = (price_data['Close'] / price_data['Open']).apply(np.log)
@@ -240,28 +244,67 @@ def calculate_historical_volatility(price_data, window=30, trading_periods=252, 
     rs = log_ho * (log_ho - log_co) + log_lo * (log_lo - log_co)
 
     close_vol = log_cc_sq.rolling(
-        window=window,
+        window=30,
         center=False
-    ).sum() * (1.0 / (window - 1.0))
+    ).sum() * (1.0 / (30 - 1.0))
 
     open_vol = log_oc_sq.rolling(
-        window=window,
+        window=30,
         center=False
-    ).sum() * (1.0 / (window - 1.0))
+    ).sum() * (1.0 / (30 - 1.0))
 
     window_rs = rs.rolling(
-        window=window,
+        window=30,
         center=False
-    ).sum() * (1.0 / (window - 1.0))
+    ).sum() * (1.0 / (30 - 1.0))
 
-    k = 0.34 / (1.34 + ((window + 1) / (window - 1)))
+    k = 0.34 / (1.34 + ((30 + 1) / (30 - 1)))
     result = (open_vol + k * close_vol + (1 - k) *
-              window_rs).apply(np.sqrt) * np.sqrt(trading_periods)
+              window_rs).apply(np.sqrt) * np.sqrt(252)
 
-    if return_last_only:
-        return result.iloc[-1]
-    else:
-        return result.dropna()
+    return result.iloc[-1]
+
+
+def naive_calculate_historical_volatility(price_data):
+    daily_returns = []
+    for i in range(1, len(price_data)):
+        daily_returns.append(
+            (price_data.iloc[i]['Close']-price_data.iloc[i-1]['Close'])/price_data.iloc[i-1]['Close'])
+    stdd = statistics.stdev(daily_returns[-30:])
+    ann_vol = stdd * np.sqrt(252)
+    return ann_vol
+
+
+def gemini_calculate_yang_zhang_volatility(df, period="30d"):
+    end_date = df.index[-1]  # Get the last date in the DataFrame
+    start_date = end_date - pd.Timedelta(period)  # Calculate the start date
+
+    # Create a boolean mask to select the desired period
+    mask = (df.index >= start_date) & (df.index <= end_date)
+    df_period = df.loc[mask]
+
+    if df_period.empty:
+        print(f"No data found for the specified period: {period}")
+        return None
+
+    # Calculate overnight volatility
+    overnight_volatility = np.log(
+        df_period['Open'] / df_period['Close'].shift(1))
+
+    # Calculate Rogers-Satchell volatility
+    rs_volatility = (np.log(df_period['High'] / df_period['Open']) * (np.log(df_period['High'] / df_period['Close'])) +
+                     np.log(df_period['Low'] / df_period['Open']) * (np.log(df_period['Low'] / df_period['Close'])))
+
+    # Calculate open-to-close volatility
+    open_to_close_volatility = np.log(df_period['Close'] / df_period['Open'])
+
+    # Calculate Yang-Zhang volatility (using typical weights)
+    k = 0.34  # You can adjust this weight
+    yang_zhang_volatility = np.sqrt((overnight_volatility.var() + k * open_to_close_volatility.var() +
+                                     # Annualize
+                                     (1 - k) * rs_volatility.mean()) * 252)
+
+    return yang_zhang_volatility
 
 
 def build_term_structure(days, impl_vols):
@@ -351,8 +394,8 @@ for symbol in stocks.tickers:
     # get the expiration dates for the options listed that are:
     #  - not today, and
     #  - not excessively in the future
-    # TODO: can the exp_dates be stored as datetime or date objects instead of strings?
-    filtered_exp_dates = filter_to_next_50d(list(single_stock.options), today)
+    filtered_exp_dates = sort_and_filter_to_next_45d(
+        list(single_stock.options), today)
     # make sure there are at least 4 provided expiration dates for the stock in the net 50d. this is a rough proxy for "does the stock have weekly options available"
     # we do this because we want to be as close as possible to targeting a 30d spread on our calendar, and without weekly options we are unlikely to be able to do that
     # note that I also think "are weekly options available" is a rough proxy for "does this stock have alot of trading volume", which is a critera we check later anyway
@@ -361,12 +404,17 @@ for symbol in stocks.tickers:
         continue
     # get the option chains for each of the expiration dates
     options_chains = {exp_date: single_stock.option_chain(
-        exp_date) for exp_date in filtered_exp_dates}
-    underlying_price = get_current_price(single_stock) if tickers_with_price_and_timestamps[symbol]["price"] is None else tickers_with_price_and_timestamps[symbol]["price"]
+        exp_date.strftime('%Y-%m-%d')) for exp_date in filtered_exp_dates}
+    underlying_price = get_current_price(
+        single_stock) if tickers_with_price_and_timestamps[symbol]["price"] is None else tickers_with_price_and_timestamps[symbol]["price"]
     if underlying_price is None:
         print("skipped! (cannot determine stock price)")
         continue
     at_the_money_impl_vols = {}
+    front_sell_call_date = filtered_exp_dates[0]
+    front_sell_call_price = 0.0
+    back_buy_call_date = filtered_exp_dates[0] + timedelta(days=28)
+    back_buy_call_price = 0.0
     for exp_date, chain in options_chains.items():
         calls = chain.calls
         puts = chain.puts
@@ -384,35 +432,47 @@ for symbol in stocks.tickers:
         put_impl_vol = puts.loc[put_min_diff_idx, 'impliedVolatility']
         at_the_money_impl_vols[exp_date] = (call_impl_vol + put_impl_vol) / 2.0
 
+        # Save the prices of the call if it is the same date as the target front or back call
+        if exp_date == front_sell_call_date:
+            front_sell_call_price = (calls.loc[call_min_diff_idx, 'bid'] + calls.loc[call_min_diff_idx, 'ask']) / 2
+        elif exp_date == back_buy_call_date:
+            back_buy_call_price = (calls.loc[call_min_diff_idx, 'bid'] + calls.loc[call_min_diff_idx, 'ask']) / 2
+
+    overall_price_per_unit = back_buy_call_price - front_sell_call_price
+
     if not at_the_money_impl_vols:
-        #TODO: should we have a certain number of at_the_money_impl_vols instead of just checking whether it is empty?
+        # TODO: should we have a certain number of at_the_money_impl_vols instead of just checking whether it is empty?
         print("skipped! (no values for at-the-money implied volatility! (need to figure out when this occurs and how we can prevent it))")
         continue
     days_to_expiry_entries = []
     impl_vols = []
     for exp_date, impl_vol in at_the_money_impl_vols.items():
-        days_to_expiry = (datetime.strptime(
-            exp_date, "%Y-%m-%d").date() - today.date()).days
+        days_to_expiry = (exp_date - today.date()).days
         days_to_expiry_entries.append(days_to_expiry)
         impl_vols.append(impl_vol)
 
-    term_spline = build_term_structure(days_to_expiry_entries, impl_vols)
+    calculate_implied_volatility = build_term_structure(
+        days_to_expiry_entries, impl_vols)
 
-    ts_slope_0_45 = (term_spline(45) - term_spline(days_to_expiry_entries[0])) / (45-days_to_expiry_entries[0])
+    # Calculate the slope of the line that crosses through the volatility value 45 days out, as well as the volatility value at the soonest expiry date
+    ts_slope_0_45 = (calculate_implied_volatility(
+        45) - calculate_implied_volatility(days_to_expiry_entries[0])) / (45-days_to_expiry_entries[0])
 
     price_history = single_stock.history(period='3mo')
-    # TODO: make sure the name of the calcualte vol function is accurate
-    iv30_rv30 = term_spline(30) / calculate_historical_volatility(price_history)
+    iv30_hv30 = calculate_implied_volatility(
+        30) / calculate_30d_historical_volatility(price_history)
 
     avg_volume = price_history['Volume'].rolling(30).mean().dropna().iloc[-1]
 
-    # if all three criteria are met, then this stock can be recommended for the strategy
+    # We do not want to consider stocks that have low average trading volume
     if (avg_volume < MIN_30D_AVG_VOLUME):
         print("skipped! (not enough average volume)")
         continue
-    if (iv30_rv30 < MIN_30D_IV_RV):
-        print("skipped! (iv/rv too low)")
+    # We do not want to consider stocks that have an implied volatility that is too low compared to their historical volatility over the last 30 days
+    if (iv30_hv30 < MIN_30D_IV_HV_RATIO):
+        print("skipped! (iv/hv too low)")
         continue
+    # We do not want to consider stocks that have a next-45-day term structure slope that is too high
     if (ts_slope_0_45 > MAX_TS_SLOPE_0_45):
         print("skipped! (ts_slope_0_45 too high)")
         continue
@@ -426,12 +486,33 @@ for symbol in stocks.tickers:
         enter_position_time = earnings_datetime.replace(
             hour=14, minute=45) - timedelta(days=1)
         exit_position_time = earnings_datetime.replace(hour=8, minute=45)
-    upcoming_earnings.append({"symbol": symbol, "price": round(underlying_price, 2), "earnings_call_datetime": tickers_with_price_and_timestamps[symbol][
-                             "earnings_call_datetime"], "enter_position_time": tickers_with_price_and_timestamps[symbol]["enter_position_time"], "exit_position_time": tickers_with_price_and_timestamps[symbol]["exit_position_time"]})
+    upcoming_earnings.append({
+        "symbol": symbol,
+        "price": round(underlying_price, 2),
+        "earnings_call_datetime": tickers_with_price_and_timestamps[symbol]["earnings_call_datetime"],
+        "enter_position_time": tickers_with_price_and_timestamps[symbol]["enter_position_time"],
+        "exit_position_time": tickers_with_price_and_timestamps[symbol]["exit_position_time"],
+        "price_per_unit": overall_price_per_unit,
+    })
     print("added!")
 
 upcoming_earnings_sorted = sorted(upcoming_earnings, key=lambda event: (
     event["earnings_call_datetime"], event["enter_position_time"]))
+# get number of earnings events in each "enter position time" bucket
+enter_position_time_counts = Counter(earning["enter_position_time"] for earning in upcoming_earnings_sorted)
+print(enter_position_time_counts)
 for upcoming_earning in upcoming_earnings_sorted:
-    # TODO: we could also use the options current price to tell the user how many calendars they should buy based on their bankroll amount
-    print(f"{upcoming_earning["symbol"]} @ {upcoming_earning["price"]} (earnings @ {upcoming_earning["earnings_call_datetime"]}) - open @ {upcoming_earning["enter_position_time"]}, close @ {upcoming_earning["exit_position_time"]}")
+    frac = KELLY_PCT
+    print(frac)
+    print(1/KELLY_PCT)
+    print(upcoming_earning['enter_position_time'])
+    print(enter_position_time_counts[upcoming_earning['enter_position_time']])
+    if enter_position_time_counts[upcoming_earning['enter_position_time']] > 1/KELLY_PCT:
+        frac = 1/enter_position_time_counts[upcoming_earning['enter_position_time']]
+        print("updating it to", frac)
+    how_many_units_to_buy = "UNK" if overall_price_per_unit < 0.01 else round((BANKROLL * frac) / overall_price_per_unit),
+    # TODO: we could also use the options current price to tell the user how many calendars they should buy based on their bankroll amount, but with diminishing sizes - also we should order the picks each day by "best" to "worst"
+    print(f"buy {how_many_units_to_buy} units of {upcoming_earning['symbol']} @ ${upcoming_earning['price']} (earnings @ {upcoming_earning['earnings_call_datetime'].strftime('%H:%M on %m/%d')}) - open @ {upcoming_earning['enter_position_time'].strftime('%H:%M on %m/%d')}, close @ {upcoming_earning['exit_position_time'].strftime('%H:%M on %m/%d')}")
+
+# TODO: have a formula that gives back a single value of "how good" a trade will be based on the values - take note of which one that guy said is the least important
+# TODO: then use that to put the trades in buckets based on "order enter datetime" and sort them within the buckets. then loop through in order and assign monetary values to each, making sure not to exceed the bankroll
