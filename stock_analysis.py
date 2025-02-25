@@ -5,14 +5,15 @@ import numpy as np
 import yfinance as yf
 import statistics
 import pandas as pd
-from collections import Counter
+from collections import defaultdict
+import math
 
 MIN_30D_AVG_VOLUME = 2000000
 MIN_30D_IV_HV_RATIO = 1.25
-MAX_TS_SLOPE_0_45 = -0.005
+MAX_TS_SLOPE_0_45 = -0.0041
 
 BANKROLL = 100000
-KELLY_PCT = 0.2
+KELLY_PCT = 0.15
 
 
 SCREENER_NAMES = [
@@ -336,8 +337,7 @@ def get_current_price(ticker):
 print("finding stocks with earnings calls in the next week... ", end="")
 screener = Screener()
 
-# Extract earnings dates
-upcoming_earnings = []
+upcoming_earnings_by_enter_datetime = defaultdict(list)
 today = datetime.today()
 one_week_later = today + timedelta(days=7)
 
@@ -411,6 +411,7 @@ for symbol in stocks.tickers:
         print("skipped! (cannot determine stock price)")
         continue
     at_the_money_impl_vols = {}
+    strike_price = 0.0
     front_sell_call_date = filtered_exp_dates[0]
     front_sell_call_price = 0.0
     back_buy_call_date = filtered_exp_dates[0] + timedelta(days=28)
@@ -431,6 +432,7 @@ for symbol in stocks.tickers:
         put_min_diff_idx = put_abs_diffs.idxmin()
         put_impl_vol = puts.loc[put_min_diff_idx, 'impliedVolatility']
         at_the_money_impl_vols[exp_date] = (call_impl_vol + put_impl_vol) / 2.0
+        strike_price = calls.loc[call_min_diff_idx, 'strike']
 
         # Save the prices of the call if it is the same date as the target front or back call
         if exp_date == front_sell_call_date:
@@ -476,6 +478,8 @@ for symbol in stocks.tickers:
     if (ts_slope_0_45 > MAX_TS_SLOPE_0_45):
         print("skipped! (ts_slope_0_45 too high)")
         continue
+    # create an somewhat-arbitrary score that we assign to the trade so that we can rank them later on
+    score = (avg_volume / 300000000.0) + (iv30_hv30 / 35.0) + (ts_slope_0_45 / -0.17)
     enter_position_time = datetime(1970, 1, 1)
     exit_position_time = datetime(1970, 1, 1)
     if earnings_datetime.time() > time(15, 59):
@@ -486,33 +490,27 @@ for symbol in stocks.tickers:
         enter_position_time = earnings_datetime.replace(
             hour=14, minute=45) - timedelta(days=1)
         exit_position_time = earnings_datetime.replace(hour=8, minute=45)
-    upcoming_earnings.append({
+    upcoming_earnings_by_enter_datetime[tickers_with_price_and_timestamps[symbol]["enter_position_time"]].append({
         "symbol": symbol,
-        "price": round(underlying_price, 2),
+        "underlying_price": round(underlying_price, 2),
+        "strike_price": strike_price,
         "earnings_call_datetime": tickers_with_price_and_timestamps[symbol]["earnings_call_datetime"],
         "enter_position_time": tickers_with_price_and_timestamps[symbol]["enter_position_time"],
         "exit_position_time": tickers_with_price_and_timestamps[symbol]["exit_position_time"],
         "price_per_unit": overall_price_per_unit,
+        "front_sell_call_date": front_sell_call_date,
+        "back_buy_call_date": back_buy_call_date,
+        "score": score
     })
     print("added!")
 
-upcoming_earnings_sorted = sorted(upcoming_earnings, key=lambda event: (
-    event["earnings_call_datetime"], event["enter_position_time"]))
-# get number of earnings events in each "enter position time" bucket
-enter_position_time_counts = Counter(earning["enter_position_time"] for earning in upcoming_earnings_sorted)
-print(enter_position_time_counts)
-for upcoming_earning in upcoming_earnings_sorted:
-    frac = KELLY_PCT
-    print(frac)
-    print(1/KELLY_PCT)
-    print(upcoming_earning['enter_position_time'])
-    print(enter_position_time_counts[upcoming_earning['enter_position_time']])
-    if enter_position_time_counts[upcoming_earning['enter_position_time']] > 1/KELLY_PCT:
-        frac = 1/enter_position_time_counts[upcoming_earning['enter_position_time']]
-        print("updating it to", frac)
-    how_many_units_to_buy = "UNK" if overall_price_per_unit < 0.01 else round((BANKROLL * frac) / overall_price_per_unit),
-    # TODO: we could also use the options current price to tell the user how many calendars they should buy based on their bankroll amount, but with diminishing sizes - also we should order the picks each day by "best" to "worst"
-    print(f"buy {how_many_units_to_buy} units of {upcoming_earning['symbol']} @ ${upcoming_earning['price']} (earnings @ {upcoming_earning['earnings_call_datetime'].strftime('%H:%M on %m/%d')}) - open @ {upcoming_earning['enter_position_time'].strftime('%H:%M on %m/%d')}, close @ {upcoming_earning['exit_position_time'].strftime('%H:%M on %m/%d')}")
+for key in sorted(upcoming_earnings_by_enter_datetime):
+    print(f"[{key.strftime('%m/%d')}]")
+    remaining_bankroll = BANKROLL
+    for upcoming_earning in sorted(upcoming_earnings_by_enter_datetime[key], key=lambda x: x["score"], reverse=True):
+        overall_price_per_option = math.ceil(upcoming_earning["price_per_unit"] * 100) + (1.3 * 2) # note: options are made up of 100 units a piece, and brokers charge $1.30 for both entering and existing a position. we also assume that the brokers round UP to the nearest cent for each unit, which puts us on the conservative side 
+        how_many_options_to_buy = -999999 if overall_price_per_option < 0.01 else math.floor((remaining_bankroll * KELLY_PCT) / overall_price_per_option)
+        print(f"({upcoming_earning['score']:.4f}) - buy {how_many_options_to_buy} units of {upcoming_earning['symbol']} @ ${upcoming_earning['strike_price']:.2f} (underlying: ${upcoming_earning['underlying_price']:.2f}) -- [calendar] {upcoming_earning['front_sell_call_date'].strftime('%m/%d')} (sell) {upcoming_earning['back_buy_call_date'].strftime('%m/%d')} (buy) -- open @ {upcoming_earning['enter_position_time'].strftime('%H:%M on %m/%d')}, close @ {upcoming_earning['exit_position_time'].strftime('%H:%M on %m/%d')} (earnings @ {upcoming_earning['earnings_call_datetime'].strftime('%H:%M on %m/%d')})")
+        remaining_bankroll -= math.ceil(float(how_many_options_to_buy) * overall_price_per_option) - 1.3 * how_many_options_to_buy
 
-# TODO: have a formula that gives back a single value of "how good" a trade will be based on the values - take note of which one that guy said is the least important
-# TODO: then use that to put the trades in buckets based on "order enter datetime" and sort them within the buckets. then loop through in order and assign monetary values to each, making sure not to exceed the bankroll
+# TODO: if you backtest, make sure you don't get overrun by the fees
