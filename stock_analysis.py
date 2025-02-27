@@ -13,7 +13,7 @@ MIN_30D_IV_HV_RATIO = 1.25
 MAX_TS_SLOPE_0_45 = -0.0041
 
 BANKROLL = 100000
-KELLY_PCT = 0.15
+KELLY_PCT = 0.20
 
 
 SCREENER_NAMES = [
@@ -357,23 +357,23 @@ for screener_name in SCREENER_NAMES:
             #
             # We disregard earnings calls that occur BMO on Monday and AMC on Friday, since that would mean we would hold our position for longer than 18h
             is_earnings_on_monday_after_market_hours = earnings_datetime.weekday(
-            ) == 0 and earnings_datetime.time() > time(15, 59)
+            ) == 0 and earnings_datetime.time() > time(14, 59)
             is_earnings_on_tue_thru_outside_of_market_hours = earnings_datetime.weekday() > 0 and earnings_datetime.weekday(
-            ) < 4 and (earnings_datetime.time() > time(15, 59) or earnings_datetime.time() < time(7, 1))
+            ) < 4 and (earnings_datetime.time() > time(14, 59) or earnings_datetime.time() < time(8, 31))
             is_earnings_on_friday_before_market_hours = earnings_datetime.weekday(
-            ) == 4 and earnings_datetime.time() < time(7, 1)
+            ) == 4 and earnings_datetime.time() < time(8, 31)
             if today <= earnings_datetime <= one_week_later and (is_earnings_on_monday_after_market_hours or is_earnings_on_tue_thru_outside_of_market_hours or is_earnings_on_friday_before_market_hours):
                 ticker = stock["symbol"]
                 is_earnings_date_an_estimate = stock["isEarningsDateEstimate"]
                 if ticker not in already_added_tickers and not is_earnings_date_an_estimate:
                     enter_position_time = datetime(1970, 1, 1)
                     exit_position_time = datetime(1970, 1, 1)
-                    if earnings_datetime.time() > time(15, 59):
+                    if earnings_datetime.time() > time(14, 59):
                         enter_position_time = earnings_datetime.replace(
                             hour=14, minute=45)
                         exit_position_time = earnings_datetime.replace(
                             hour=8, minute=45) + timedelta(days=1)
-                    elif earnings_datetime.time() < time(7, 1):
+                    elif earnings_datetime.time() < time(8, 31):
                         enter_position_time = earnings_datetime.replace(
                             hour=14, minute=45) - timedelta(days=1)
                         exit_position_time = earnings_datetime.replace(
@@ -479,7 +479,7 @@ for symbol in stocks.tickers:
         print("skipped! (ts_slope_0_45 too high)")
         continue
     # create an somewhat-arbitrary score that we assign to the trade so that we can rank them later on
-    score = (avg_volume / 300000000.0) + (iv30_hv30 / 35.0) + (ts_slope_0_45 / -0.17)
+    score = min(0.05, 0.03*math.log(avg_volume-1300000)-0.174) + min(0.04, 0.2*math.log(iv30_hv30)-0.0204) + min(0.09, 20.1*math.log(-1*ts_slope_0_45+1)-0.0262)
     enter_position_time = datetime(1970, 1, 1)
     exit_position_time = datetime(1970, 1, 1)
     if earnings_datetime.time() > time(15, 59):
